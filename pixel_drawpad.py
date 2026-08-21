@@ -228,8 +228,6 @@ class PixelDrawpad:
             for x in range(GRID_SIZE):
                 r, g, b = self.pixels[y][x]
                 rgb_sum = r + g + b
-                if rgb_sum == 765:
-                    rgb_sum = 0
                 grid[y][x] = rgb_sum
 
         data = {
