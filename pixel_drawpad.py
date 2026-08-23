@@ -14,21 +14,47 @@ Clicking "Save Pixel Data (JSON)" writes a file like:
   "width": 64,
   "height": 64,
   "grid": [
-    [765, 232, 0, ...],   <- row y=0 (top row), 64 values left to right
-    [12,  580, 99, ...],  <- row y=1
-    ...                   <- 64 rows total, top to bottom
+    [10748681, 16776961, 1, ...],  <- row y=0 (top row), 64 values left to right
+    [65281,    256,      100, ...],<- row y=1
+    ...                             <- 64 rows total, top to bottom
   ]
 }
 
-Each value is r + g + b for that pixel (range 0-765) -- the number
-handed off to the secondary program as a tone frequency. The full RGB
-breakdown isn't stored, so it can't be turned back into the exact
-original color, only its sum.
+Each value is the pixel's full (r, g, b) packed into a single 24-bit
+integer, one byte per channel:
 
-One exception: white pixels (r+g+b == 765, i.e. untouched/blank cells)
-are saved as 0 instead of 765. This is intentional -- it lets the
-secondary program treat 0 as "silence/no tone" for any cell that was
-never painted, rather than playing a tone for blank space.
+    packed = (r << 16) | (g << 8) | b     # range 0 - 16,777,215 (0xFFFFFF)
+
+This preserves the exact original color -- unlike a summed value,
+packing loses no information, since r, g, and b each occupy their own
+non-overlapping 8 bits. Unpacking is cheap bit-masking, no string
+parsing required:
+
+    r = (packed >> 16) & 0xFF
+    g = (packed >> 8)  & 0xFF
+    b = packed & 0xFF
+
+0 is reserved exclusively for untouched/blank cells (i.e. white,
+r=g=b=255), so the secondary program can treat 0 as "silence/no tone".
+Black (r=g=b=0) packs to 0 on its own, which would collide with that
+sentinel -- so every real color's packed value is offset by +1 before
+saving:
+
+    stored_value = 0                          if pixel is white (blank)
+    stored_value = ((r << 16)|(g << 8)|b) + 1 otherwise
+
+This keeps black -- and every other painted color -- distinguishable
+from an untouched cell. To unpack a non-zero stored value, subtract 1
+first:
+
+    def unpack(stored_value):
+        if stored_value == 0:
+            return (255, 255, 255)      # untouched/white
+        packed = stored_value - 1
+        r = (packed >> 16) & 0xFF
+        g = (packed >> 8) & 0xFF
+        b = packed & 0xFF
+        return r, g, b
 
 "grid" is a plain 64x64 nested array, grid[y][x], stored top-to-bottom,
 left-to-right. This one representation is all a secondary program
@@ -40,27 +66,27 @@ extra copies of the data to keep in sync:
     with open("pixel_data.json") as f:
         data = json.load(f)
 
-    grid = data["grid"]  # grid[y][x] -> frequency value (0-765)
+    grid = data["grid"]  # grid[y][x] -> stored value (0 = white/silence)
 
     # Left to right, top to bottom (row by row, forward)
     for row in grid:
         for value in row:
-            play(value)
+            play(unpack(value))
 
     # Right to left, top to bottom (each row reversed)
     for row in grid:
         for value in reversed(row):
-            play(value)
+            play(unpack(value))
 
     # Top to bottom, left to right (column by column, forward)
     for x in range(len(grid[0])):
         for row in grid:
-            play(row[x])
+            play(unpack(row[x]))
 
     # Bottom to top, left to right (rows walked in reverse)
     for x in range(len(grid[0])):
         for row in reversed(grid):
-            play(row[x])
+            play(unpack(row[x]))
 
 Every one of the 64*64 = 4096 cells is always present (even
 untouched/white ones), so the secondary program can rely on a
@@ -219,16 +245,27 @@ class PixelDrawpad:
         if not filepath:
             return
 
-        # grid[y][x] = r+g+b sum, stored top-to-bottom, left-to-right.
-        # This single 2D array is enough for scanning in any direction --
-        # no redundant flat list to keep in sync.
+        # grid[y][x] = (r, g, b) packed into one 24-bit integer, stored
+        # top-to-bottom, left-to-right. Packing (rather than summing)
+        # keeps every channel intact -- r, g, and b each live in their
+        # own 8 bits, so no color information is lost.
+        #
+        # 0 is reserved exclusively for "blank/white" (silence). Black
+        # (0,0,0) packs to 0 on its own, which would collide with that
+        # sentinel, so every real color's packed value is offset by +1
+        # before saving. This keeps black -- and every other color --
+        # distinguishable from an untouched cell.
         grid = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
 
         for y in range(GRID_SIZE):
             for x in range(GRID_SIZE):
                 r, g, b = self.pixels[y][x]
-                rgb_sum = r + g + b
-                grid[y][x] = rgb_sum
+                if (r, g, b) == DEFAULT_COLOR:
+                    # Untouched/blank cell -> the only value allowed to be 0
+                    packed = 0
+                else:
+                    packed = ((r << 16) | (g << 8) | b) + 1
+                grid[y][x] = packed
 
         data = {
             "width": GRID_SIZE,
@@ -261,20 +298,22 @@ class PixelDrawpad:
 
             for entry in entries:
                 x, y = entry["x"], entry["y"]
-                # Only the r+g+b sum was saved, so the exact original color
-                # can't be recovered. Rebuild a grayscale approximation
-                # (same sum, split evenly across channels) just so the
-                # canvas has something reasonable to show.
-                value = min(max(entry["value"], 0), 765)
-                gray = value // 3
-                rgb = (gray, gray, gray)
+                value = entry["value"]
+                if value == 0:
+                    # 0 is the reserved "blank/white" sentinel
+                    rgb = DEFAULT_COLOR
+                else:
+                    # Reverse the +1 offset applied at save time, then unpack
+                    value = min(max(value, 1), 0xFFFFFF + 1)
+                    packed = value - 1
+                    r = (packed >> 16) & 0xFF
+                    g = (packed >> 8) & 0xFF
+                    b = packed & 0xFF
+                    rgb = (r, g, b)
                 if 0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE:
                     self.pixels[y][x] = rgb
                     self.canvas.itemconfig(self.rects[y][x], fill=self._rgb_to_hex(rgb))
-            self.status_label.config(
-                text=f"Loaded {os.path.basename(filepath)} (grayscale approximation, "
-                     f"exact RGB not recoverable from sum-only data)"
-            )
+            self.status_label.config(text=f"Loaded {os.path.basename(filepath)}")
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
 
